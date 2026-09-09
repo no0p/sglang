@@ -2439,14 +2439,55 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _wait_for_gc_freeze_readiness(server_args: ServerArgs, timeout: float = 10.0):
+    """Wait for HTTP readiness without generating tokens or enabling warmup.
+
+    The lifespan starts the warmup thread before the HTTP listener is bound.
+    Normal generation warmup waits for that listener, but skip_server_warmup
+    bypasses the wait too (e.g. in MILES). Probe /model_info independently:
+    unlike /health, it cannot trigger generation via an environment setting.
+    Retry transient startup failures within a deadline; do not hide bad auth
+    or TLS configuration. This is optional GC setup, not the serving health gate.
+    """
+    headers = {}
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.exceptions.Timeout("HTTP readiness deadline before GC freeze")
+        try:
+            with requests.get(
+                server_args.url() + "/model_info",
+                headers=headers,
+                timeout=min(1.0, remaining),
+                verify=server_args.ssl_verify(),
+            ) as res:
+                if res.status_code != 503:
+                    res.raise_for_status()
+                    return
+        except requests.exceptions.SSLError:
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
-    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
-    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    """After optional warmup and HTTP readiness, freeze long-lived Python objects.
+
+    gc.freeze() removes existing objects from future cyclic-GC scans to reduce
+    CPU latency jitter; it does not freeze model weights or free GPU memory.
+    The HTTP request freezes the tokenizer and dispatches the same operation
+    to the scheduler and detokenizer. Keep this optimization best-effort.
+    """
     freeze_key = server_args.admin_api_key or server_args.api_key
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
     try:
+        _wait_for_gc_freeze_readiness(server_args)
         res = requests.post(
             server_args.url() + "/freeze_gc",
             headers=freeze_headers,
@@ -2481,6 +2522,8 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    # Sequence: optional generation warmup -> HTTP readiness (even when warmup
+    # is skipped) -> best-effort GC freeze -> readiness log / launch callback.
     _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
